@@ -4,37 +4,13 @@ use crate::{
     Error, DATA_MAX_LEN,
 };
 use core::{convert::Infallible, ops::ControlFlow};
-use std::{
-    sync::mpsc::{channel, Receiver},
-    thread,
-};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use zmq::{Context, Socket};
-
-fn break_on_err(is_err: bool) -> ControlFlow<()> {
-    if is_err {
-        ControlFlow::Break(())
-    } else {
-        ControlFlow::Continue(())
-    }
-}
-
-/// Subscribes to a single ZMQ endpoint and returns a [`Receiver`].
-#[inline]
-pub fn subscribe_single(endpoint: &str) -> Result<Receiver<Result<Message>>> {
-    let (tx, rx) = channel();
-    let context = Context::new();
-
-    let socket = new_socket_internal(&context, endpoint)?;
-
-    thread::spawn(move || subscribe_internal(socket, |msg| break_on_err(tx.send(msg).is_err())));
-
-    Ok(rx)
-}
 
 /// Subscribes to multiple ZMQ endpoints and returns a [`Receiver`].
 #[inline]
 pub fn subscribe_multi(endpoints: &[&str]) -> Result<Receiver<Result<Message>>> {
-    let (tx, rx) = channel();
+    let (tx, rx) = channel(endpoints.len());
     let context = Context::new();
 
     for endpoint in endpoints {
@@ -42,62 +18,24 @@ pub fn subscribe_multi(endpoints: &[&str]) -> Result<Receiver<Result<Message>>> 
 
         let socket = new_socket_internal(&context, endpoint)?;
 
-        thread::spawn(move || {
-            subscribe_internal(socket, |msg| break_on_err(tx.send(msg).is_err()))
-        });
+        tokio::spawn(subscribe_internal::<()>(socket, tx));
     }
 
     Ok(rx)
 }
 
-/// Subscribes to a single ZMQ endpoint and blocks the thread until [`ControlFlow::Break`] is
-/// returned by the callback.
+
+/// Subscribes to a single ZMQ endpoint and returns a [`Receiver`].
 #[inline]
-pub fn subscribe_single_blocking<F, B>(
-    endpoint: &str,
-    callback: F,
-) -> Result<ControlFlow<B, Infallible>>
-where
-    F: Fn(Result<Message>) -> ControlFlow<B>,
-{
+pub async fn subscribe_single(endpoint: &str) -> Result<Receiver<Result<Message>>> {
+    let (tx, rx) = channel(1);
     let context = Context::new();
 
     let socket = new_socket_internal(&context, endpoint)?;
 
-    Ok(subscribe_internal(socket, callback))
-}
+    tokio::spawn(subscribe_internal::<()>(socket, tx));
 
-/// Subscribes to multiple ZMQ endpoints and blocks the thread until [`ControlFlow::Break`] is
-/// returned by the callback.
-#[inline]
-pub fn subscribe_multi_blocking<F, B>(
-    endpoints: &[&str],
-    callback: F,
-) -> Result<ControlFlow<B, Infallible>>
-where
-    F: Fn(Result<Message>) -> ControlFlow<B>,
-{
-    let (tx, rx) = channel();
-    let context = Context::new();
-
-    for endpoint in endpoints {
-        let tx = tx.clone();
-
-        let socket = new_socket_internal(&context, endpoint)?;
-
-        thread::spawn(move || {
-            subscribe_internal(socket, |msg| break_on_err(tx.send(msg).is_err()))
-        });
-    }
-
-    Ok((|| {
-        for msg in rx {
-            callback(msg)?;
-        }
-
-        // `tx` is dropped at the end of this function
-        unreachable!();
-    })())
+    Ok(rx)
 }
 
 #[inline]
@@ -155,16 +93,19 @@ fn recv_internal(socket: &Socket, data: &mut [u8; DATA_MAX_LEN]) -> Result<Messa
 }
 
 #[inline]
-fn subscribe_internal<F, B>(socket: Socket, callback: F) -> ControlFlow<B, Infallible>
-where
-    F: Fn(Result<Message>) -> ControlFlow<B>,
-{
+async fn subscribe_internal<B>(
+    socket: Socket,
+    tx: Sender<Result<Message>>,
+) -> ControlFlow<B, Infallible> {
     let mut data: Box<[u8; DATA_MAX_LEN]> =
         vec![0; DATA_MAX_LEN].into_boxed_slice().try_into().unwrap();
 
     loop {
         let msg = recv_internal(&socket, &mut data);
 
-        callback(msg)?;
+        match tx.send(msg).await {
+            Ok(_) => ControlFlow::Continue(()),
+            Err(_) => ControlFlow::Break(()),
+        };
     }
 }
